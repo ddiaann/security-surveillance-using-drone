@@ -1,0 +1,267 @@
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+import open_clip
+import time
+from djitellopy import Tello
+import os
+import pandas as pd
+from datetime import datetime
+
+# ============================
+# DEVICE
+# ============================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", device)
+
+# ============================
+# LOAD MobileNetSSD
+# ============================
+prototxt = r"C:\Users\Asus\Downloads\FYP1\Human-Detection-and-Tracking-through-the-DJI-Tello-minidrone-master\MobileNetSSD_deploy.prototxt"
+modelpath = r"C:\Users\Asus\Downloads\FYP1\Human-Detection-and-Tracking-through-the-DJI-Tello-minidrone-master\MobileNetSSD_deploy.caffemodel"
+net = cv2.dnn.readNetFromCaffe(prototxt, modelpath)
+
+CLASSES = ["background","aeroplane","bicycle","bird","boat","bottle","bus",
+           "car","cat","chair","cow","diningtable","dog","horse","motorbike",
+           "person","pottedplant","sheep","sofa","train","tvmonitor"]
+
+# ============================
+# OpenCLIP ReID
+# ============================
+clip_model, _, preprocess = open_clip.create_model_and_transforms(
+    "ViT-B-32", pretrained="openai"
+)
+clip_model = clip_model.to(device).eval()
+
+def extract_feature(crop):
+    crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    img = preprocess(Image.fromarray(crop_rgb)).unsqueeze(0).to(device)
+    with torch.no_grad():
+        feat = clip_model.encode_image(img)
+        feat /= feat.norm(dim=-1, keepdim=True)
+    return feat
+
+# ============================
+# STATIC CAMERA
+# ============================
+cap = cv2.VideoCapture(1)
+assert cap.isOpened(), "Static camera not found"
+
+# ============================
+# DRONE SETUP
+# ============================
+drone = Tello()
+drone.connect()
+print("Battery:", drone.get_battery(), "%")
+drone.streamon()
+frame_read = drone.get_frame_read()
+while frame_read.frame is None:
+    time.sleep(0.1)
+
+# ============================
+# VIDEO WRITER (SIDE-BY-SIDE, AUTO-INCREMENT)
+# ============================
+base_name = "dual_cam_reid_pi_control"
+ext = ".mp4"
+i = 1
+while os.path.exists(f"{base_name}{i}{ext}"):
+    i += 1
+output_path = f"{base_name}{i}{ext}"
+print("Saving video to:", output_path)
+
+out = cv2.VideoWriter(
+    output_path,
+    cv2.VideoWriter_fourcc(*'mp4v'),
+    20,
+    (1280, 360)
+)
+
+# ============================
+# EXCEL LOGGING SETUP
+# ============================
+columns = [
+    "timestamp", "person_detected", "reid_similarity",
+    "reid_matched", "tracking_success", "tracking_best_similarity",
+    "system_fps", "system_latency_ms"
+]
+log_data = []
+
+# ============================
+# TARGET STATE & CONTROL PARAMETERS
+# ============================
+target_features = {}  # {ID: feature}
+next_static_id = 1
+target_locked = False
+drone_airborne = False
+
+rifX, rifY = 960/2, 720/2
+Kp_X, Ki_X = 0.2, 0.0
+Kp_Y, Ki_Y = 0.2, 0.0
+Kp_dist = 0.05
+Tc = 0.05
+integral_X = 0
+integral_Y = 0
+target_bbox_height = 650
+
+prev_time = time.time()
+
+# ============================
+# MAIN LOOP
+# ============================
+while True:
+    frame_start = time.time()
+    ret, frame_s = cap.read()
+    if not ret:
+        continue
+
+    # ---------- STATIC CAMERA ----------
+    blob = cv2.dnn.blobFromImage(frame_s, 0.007843, (300,300), (127.5,127.5,127.5))
+    net.setInput(blob)
+    detections = net.forward()
+
+    current_frame_ids = []
+    person_present = False
+
+    for i in range(detections.shape[2]):
+        conf = detections[0,0,i,2]
+        idx = int(detections[0,0,i,1])
+        if CLASSES[idx] != "person" or conf < 0.6:
+            continue
+
+        box = detections[0,0,i,3:7] * np.array(frame_s.shape[1::-1]*2)
+        x1, y1, x2, y2 = box.astype(int)
+        crop = frame_s[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+
+        person_present = True
+
+        # Lock target only once in static view
+        if not target_locked:
+            target_feature = extract_feature(crop)
+            target_locked = True
+            print("Target locked in static camera. Waiting for target to leave...")
+
+        # Assign dynamic ID (for single person demo, use ID 1)
+        current_frame_ids.append(1)
+
+        cv2.rectangle(frame_s,(x1,y1),(x2,y2),(0,255,0),2)
+        cv2.putText(frame_s,"ID: 1",(x1,y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
+
+    # ---------- DRONE TAKEOFF LOGIC ----------
+    if target_locked and not person_present and not drone_airborne:
+        print("Person left static camera view! Drone taking off...")
+        drone.takeoff()
+        time.sleep(1)
+        drone.move_up(30)
+        time.sleep(1)
+        drone_airborne = True
+
+    # ---------- DRONE CAMERA ----------
+    frame_d_raw = frame_read.frame
+    if frame_d_raw is None:
+        continue
+    frame_d = cv2.cvtColor(frame_d_raw, cv2.COLOR_BGR2RGB)
+    h, w, _ = frame_d.shape
+
+    best_id, best_sim, best_box = None, 0, None
+    if drone_airborne:
+        blob_d = cv2.dnn.blobFromImage(frame_d, 0.007843, (180,180), (127.5,127.5,127.5))
+        net.setInput(blob_d)
+        detections_d = net.forward()
+
+        for i in range(detections_d.shape[2]):
+            conf_d = detections_d[0,0,i,2]
+            idx_d = int(detections_d[0,0,i,1])
+            if CLASSES[idx_d] != "person" or conf_d < 0.5:
+                continue
+
+            box_d = detections_d[0,0,i,3:7] * np.array([w,h,w,h])
+            x1d, y1d, x2d, y2d = box_d.astype(int)
+            crop_d = frame_d[y1d:y2d, x1d:x2d]
+            if crop_d.size == 0:
+                continue
+
+            crop_feat = extract_feature(crop_d)
+            sim = torch.cosine_similarity(crop_feat, target_feature).item()
+            if sim > best_sim:
+                best_sim = sim
+                best_id = 1  # matches static ID
+                best_box = (x1d, y1d, x2d, y2d)
+
+        # ---------- PI CONTROL ----------
+        if best_box and best_sim > 0.7:
+            x1, y1, x2, y2 = best_box
+            centroX = (x1 + x2)/2
+            centroY = (2*y1 + y2)/3
+            bbox_h = y2 - y1
+
+            error_X = -(rifX - centroX)
+            error_Y = rifY - centroY
+            integral_X += error_X * Tc
+            integral_Y += error_Y * Tc
+            uX = Kp_X*error_X + Ki_X*integral_X
+            uY = Kp_Y*error_Y + Ki_Y*integral_Y
+            move_fb = int(np.clip(Kp_dist*(target_bbox_height-bbox_h), -30,30))
+            move_yaw = int(np.clip(uX,-30,30))
+            move_updown = int(np.clip(uY,-10,10))
+            drone.send_rc_control(0, move_fb, move_updown, move_yaw)
+
+            cv2.rectangle(frame_d,(x1,y1),(x2,y2),(0,255,0),2)
+            cv2.putText(frame_d,f"ReID: {best_id} {best_sim*100:.1f}%",(x1,y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
+        else:
+            drone.send_rc_control(0,0,0,0)
+    # ---------- DISPLAY + SAVE ----------
+    combined = np.hstack((
+        cv2.resize(frame_s,(640,360)),
+        cv2.resize(frame_d,(640,360))
+    ))
+    cv2.imshow("Static -> Drone Transition", combined)
+    out.write(combined)
+
+    # ---------- LOGGING DATA ----------
+    frame_end = time.time()
+    fps = 1.0 / (frame_end - prev_time)
+    prev_time = frame_end
+    system_latency_ms = (frame_end - frame_start)*1000
+
+    log_data.append({
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+        "person_detected": len(current_frame_ids) > 0,
+        "reid_similarity": best_sim if best_sim>0 else 0,
+        "reid_matched": best_id if best_id else None,
+        "tracking_success": best_sim>0.7 if best_id else False,
+        "tracking_best_similarity": best_sim if best_sim>0 else 0,
+        "system_fps": fps,
+        "system_latency_ms": system_latency_ms
+    })
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# ============================
+# CLEANUP
+# ============================
+if drone_airborne:
+    drone.land()
+cap.release()
+drone.streamoff()
+out.release()
+cv2.destroyAllWindows()
+drone.end()
+
+# ============================
+# SAVE EXCEL LOG
+# ============================
+df = pd.DataFrame(log_data)
+excel_base = "tracking_log"
+i = 1
+while os.path.exists(f"{excel_base}{i}.xlsx"):
+    i += 1
+excel_path = f"{excel_base}{i}.xlsx"
+df.to_excel(excel_path, index=False)
+print("Saved video:", output_path)
+print("Saved tracking log:", excel_path)
