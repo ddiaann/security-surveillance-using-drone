@@ -20,6 +20,6 @@ This project implements an integrate security surveillance system that leverages
   
 4. System Architecture
 The system operates in three main phases:
-1. Detection: Static camera detects a subject of interest.
-2. Handover: Coordination logic signals to drone to intercept or follow.
-3. Re-IDentification: The Transformer model geenrates embeddings to match the subject's identity between the drone's aerial feed and the ground camera's static feed.
+   1. Detection: Static camera detects a subject of interest.
+   2. Handover: Coordination logic signals to drone to intercept or follow.
+   3. Re-IDentification: The Transformer model geenrates embeddings to match the subject's identity between the drone's aerial feed and the ground camera's static feed.
